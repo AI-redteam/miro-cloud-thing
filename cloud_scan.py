@@ -17,13 +17,11 @@ import argparse
 import json
 import re
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-import botocore.exceptions
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -525,7 +523,7 @@ def scan_cloudfront_distributions(session: boto3.Session, _region: str, _account
     resources = {}
     paginator = cf.get_paginator("list_distributions")
     for page in paginator.paginate():
-        dist_list = page.get("DistributionList", {})
+        dist_list = page.get("DistributionList") or {}
         for dist in dist_list.get("Items", []):
             arn = dist.get("ARN", "")
             if arn:
@@ -559,7 +557,7 @@ def scan_sns_topics(session: boto3.Session, region: str, _account: str) -> dict:
     return resources
 
 
-def scan_sqs_queues(session: boto3.Session, region: str, account: str) -> dict:
+def scan_sqs_queues(session: boto3.Session, region: str, _account: str) -> dict:
     sqs = session.client("sqs", region_name=region)
     resources = {}
     paginator = sqs.get_paginator("list_queues")
@@ -581,7 +579,8 @@ def scan_cloudtrail_trails(session: boto3.Session, region: str, _account: str) -
     resources = {}
     for trail in ct.describe_trails().get("trailList", []):
         arn = trail.get("TrailARN", "")
-        if arn:
+        # Filter to trails homed in this region to avoid duplicates across regions
+        if arn and trail.get("HomeRegion", region) == region:
             resources[arn] = trail
     return resources
 
@@ -625,7 +624,7 @@ def scan_autoscaling_groups(session: boto3.Session, region: str, _account: str) 
     return resources
 
 
-def scan_athena_named_queries(session: boto3.Session, region: str, _account: str) -> dict:
+def scan_athena_named_queries(session: boto3.Session, region: str, account: str) -> dict:
     athena = session.client("athena", region_name=region)
     resources = {}
     query_ids = []
@@ -639,7 +638,8 @@ def scan_athena_named_queries(session: boto3.Session, region: str, _account: str
             for nq in resp.get("NamedQueries", []):
                 nq_id = nq.get("NamedQueryId", "")
                 if nq_id:
-                    arn = build_arn("athena", region, _account, f"workgroup/primary/query/{nq_id}")
+                    workgroup = nq.get("WorkGroup", "primary")
+                    arn = build_arn("athena", region, account, f"workgroup/{workgroup}/query/{nq_id}")
                     resources[arn] = nq
     return resources
 
@@ -660,7 +660,7 @@ def scan_opensearch_domains(session: boto3.Session, region: str, _account: str) 
     return resources
 
 
-def scan_redshift_clusters(session: boto3.Session, region: str, _account: str) -> dict:
+def scan_redshift_clusters(session: boto3.Session, region: str, account: str) -> dict:
     rs = session.client("redshift", region_name=region)
     resources = {}
     paginator = rs.get_paginator("describe_clusters")
@@ -668,7 +668,7 @@ def scan_redshift_clusters(session: boto3.Session, region: str, _account: str) -
         for cluster in page.get("Clusters", []):
             cid = cluster.get("ClusterIdentifier", "")
             if cid:
-                arn = build_arn("redshift", region, _account, f"cluster:{cid}")
+                arn = build_arn("redshift", region, account, f"cluster:{cid}")
                 resources[arn] = cluster
     return resources
 
@@ -725,7 +725,7 @@ REGIONAL_SCANNERS = {
 # Tags scanner
 # ---------------------------------------------------------------------------
 
-def scan_tags(session: boto3.Session, profile: str | None) -> tuple[dict, list]:
+def scan_tags(session: boto3.Session) -> tuple[dict, list]:
     """Fetch tags for all supported resource types using Resource Groups Tagging API."""
     client = session.client("resourcegroupstaggingapi")
     tags: dict[str, dict[str, str]] = {}
@@ -1163,18 +1163,23 @@ def main() -> None:
     # --- Scan regional services ---
     for region in regions:
         log(f"\nRegion: {region}")
-        session = get_session(args.profile, region)
+        region_session = get_session(args.profile, region)
 
-        def _run_scanner(entry: tuple[str, Any]) -> tuple[str, dict, str | None]:
-            sname, sfn = entry
-            try:
-                result = sfn(session, region, account_id)
-                return sname, result, None
-            except Exception as e:
-                return sname, {}, str(e)
+        def _make_runner(sess: boto3.Session, rgn: str, acct: str):
+            """Bind loop variables to avoid late-binding closure issues."""
+            def _run_scanner(entry: tuple[str, Any]) -> tuple[str, dict, str | None]:
+                sname, sfn = entry
+                try:
+                    result = sfn(sess, rgn, acct)
+                    return sname, result, None
+                except Exception as e:
+                    return sname, {}, str(e)
+            return _run_scanner
+
+        runner = _make_runner(region_session, region, account_id)
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run_scanner, item): item[0] for item in REGIONAL_SCANNERS.items()}
+            futures = {pool.submit(runner, item): item[0] for item in REGIONAL_SCANNERS.items()}
             for future in as_completed(futures):
                 sname, result, err = future.result()
                 if err:
@@ -1184,11 +1189,14 @@ def main() -> None:
                     all_resources.update(result)
                     log(f"  {sname}: {len(result)}")
 
-    # --- Scan tags ---
+    # --- Scan tags (per-region, since the Tagging API is regional) ---
     log("\nFetching tags...")
-    session = get_session(args.profile, regions[0])
-    all_tags, tag_errors = scan_tags(session, args.profile)
-    all_errors.extend(tag_errors)
+    all_tags: dict[str, dict[str, str]] = {}
+    for region in regions:
+        tag_session = get_session(args.profile, region)
+        region_tags, tag_errors = scan_tags(tag_session)
+        all_tags.update(region_tags)
+        all_errors.extend(tag_errors)
     log(f"  tagged resources: {len(all_tags)}")
 
     finished_at = datetime.now(timezone.utc)
